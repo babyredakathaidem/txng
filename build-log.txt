@@ -1,0 +1,30 @@
+
+> build
+> vite build
+
+[36mvite v7.3.1 [32mbuilding client environment for production...[36m[39m
+transforming...
+[33m../../../../D:/XAMpp/htdocs/traceability/resources/js/Pages/Enterprise/Certificates/Index.vue (82:2): Error when using sourcemap for reporting an error: Can't resolve original location of error.[39m
+[32m✓[39m 3221 modules transformed.
+[31m✗[39m Build failed in 7.18s
+[31merror during build:
+[31m../../../../D:/XAMpp/htdocs/traceability/resources/js/Pages/Enterprise/Certificates/Index.vue (82:2): "CheckBadgeIcon" is not exported by "../../../../D:/XAMpp/htdocs/traceability/node_modules/lucide-vue-next/dist/esm/lucide-vue-next.js", imported by "../../../../D:/XAMpp/htdocs/traceability/resources/js/Pages/Enterprise/Certificates/Index.vue".[31m
+file: [36mD:/XAMpp/htdocs/traceability/resources/js/Pages/Enterprise/Certificates/Index.vue:82:2[31m
+[33m
+80:   CalendarIcon,
+81:   IdentificationIcon,
+82:   CheckBadgeIcon,
+      ^
+83:   NoSymbolIcon,
+84:   DocumentArrowUpIcon,
+[31m
+    at getRollupError (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/parseAst.js:402:41)
+    at error (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/parseAst.js:398:42)
+    at Module.error (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/node-entry.js:17037:16)
+    at Module.traceVariable (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/node-entry.js:17449:29)
+    at ModuleScope.findVariable (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/node-entry.js:15067:39)
+    at ChildScope.findVariable (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/node-entry.js:5673:38)
+    at FunctionScope.findVariable (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/node-entry.js:5673:38)
+    at FunctionBodyScope.findVariable (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/node-entry.js:5673:38)
+    at ReturnValueScope.findVariable (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/node-entry.js:5673:38)
+    at FunctionBodyScope.findVariable (file:///d:/XAMpp/htdocs/traceability/node_modules/rollup/dist/es/shared/node-entry.js:5673:38)[39m

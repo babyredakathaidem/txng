@@ -1,0 +1,663 @@
+📋 Tổng quan các Phase
+Phase 1 — Schema & Core Models
+Phase 2 — Event Engine (3 loại sự kiện)
+Phase 3 — Lineage & QR Scan
+Phase 4 — GS1 / TT02 Compliance
+Phase 5 — Frontend
+Phase 6 — Blockchain & IPFS Integration
+
+🔴 PHASE 1 — Schema & Core Models
+Prompt 1.1 — Migration
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+Hệ thống truy xuất nguồn gốc nông sản chuẩn Thông tư 02/2024/TT-BKHCN + TCVN 13274:2020.
+Architecture mới: Sự kiện là trung tâm — lô hàng sinh ra từ sự kiện.
+
+NHIỆM VỤ:
+Viết migration files theo đúng thứ tự sau:
+
+--- BƯỚC 1: Refactor bảng trace_events ---
+Thêm các cột sau vào bảng trace_events hiện có:
+- event_category: ENUM('observation','transformation','transfer_in','transfer_out') NOT NULL DEFAULT 'observation'
+- event_code: VARCHAR(80) NULLABLE UNIQUE — format (251)EVT-{ENT_CODE}-{CTE}-{YYYYMM}-{SEQ3}
+- trace_location_id: FK → trace_locations NULLABLE (thay thế dần where_address text)
+- to_enterprise_id: FK → enterprises NULLABLE — chỉ dùng khi transfer_out
+- from_enterprise_id: FK → enterprises NULLABLE — chỉ dùng khi transfer_in
+- external_party_name: VARCHAR(255) NULLABLE — tên bên ngoài hệ thống nếu có
+- external_ref: VARCHAR(255) NULLABLE — số hóa đơn/hợp đồng bên ngoài
+- transfer_status: ENUM('pending','accepted','rejected') NULLABLE
+- accepted_at: TIMESTAMP NULLABLE
+- rejected_at: TIMESTAMP NULLABLE
+- rejection_reason: TEXT NULLABLE
+- gs1_document_ref: VARCHAR(255) NULLABLE — AI(400) số chứng từ GS1
+
+XÓA cột: batch_id (không còn FK 1-1 với batch nữa)
+GIỮ NGUYÊN tất cả cột còn lại.
+
+--- BƯỚC 2: Tạo bảng event_input_batches ---
+Schema:
+- id
+- trace_event_id: FK → trace_events CASCADE DELETE
+- batch_id: FK → batches CASCADE DELETE
+- quantity: DECIMAL(12,3) NULLABLE
+- unit: VARCHAR(50) NULLABLE
+- UNIQUE(trace_event_id, batch_id)
+- INDEX(batch_id)
+
+--- BƯỚC 3: Tạo bảng event_output_batches ---
+Schema:
+- id  
+- trace_event_id: FK → trace_events CASCADE DELETE
+- batch_id: FK → batches CASCADE DELETE
+- quantity: DECIMAL(12,3) NULLABLE
+- unit: VARCHAR(50) NULLABLE
+- UNIQUE(trace_event_id, batch_id)
+- INDEX(batch_id)
+
+--- BƯỚC 4: Refactor bảng batches ---
+Thêm cột:
+- origin_event_id: FK → trace_events NULLABLE SET NULL — sự kiện nào sinh ra lô này
+- batch_type: ENUM đổi thành ('raw_material','wip','finished') — giữ migration an toàn
+- gtin_cached: VARCHAR(14) NULLABLE — cache GTIN-14 để query nhanh
+- gs1_128_label: VARCHAR(500) NULLABLE — cache GS1-128 string đầy đủ
+
+--- BƯỚC 5: Tạo bảng event_certificates ---
+Schema:
+- id
+- trace_event_id: FK → trace_events CASCADE DELETE — sự kiện kiểm định sinh ra cert này
+- batch_id: FK → batches CASCADE DELETE — gắn vào lô nào
+- certificate_id: FK → certificates NULLABLE — loại chứng chỉ
+- result: ENUM('pass','fail','conditional') DEFAULT 'pass'
+- reference_no: VARCHAR(100) NULLABLE — số phiếu kiểm nghiệm AI(400)
+- issued_date: DATE NULLABLE
+- expiry_date: DATE NULLABLE
+- note: TEXT NULLABLE
+- INDEX(batch_id)
+- INDEX(trace_event_id)
+
+LƯU Ý QUAN TRỌNG:
+- Mỗi migration 1 file riêng với timestamp tăng dần
+- Dùng Schema::table() cho alter, không drop-recreate
+- Tất cả FK dùng constrained() với hành vi rõ ràng
+- Viết down() đầy đủ để rollback được
+- Không xóa dữ liệu cũ trong migration
+
+Prompt 1.2 — Core Models
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+Đọc kỹ các migration vừa tạo ở Phase 1.1 trước khi viết model.
+Hệ thống truy xuất nguồn gốc — sự kiện là trung tâm.
+
+NHIỆM VỤ:
+Viết/refactor các Model sau:
+
+--- Model 1: TraceEvent (refactor) ---
+File: app/Models/TraceEvent.php
+
+Relations cần có:
+- inputBatches(): BelongsToMany qua event_input_batches (withPivot quantity, unit)
+- outputBatches(): BelongsToMany qua event_output_batches (withPivot quantity, unit)
+- traceLocation(): BelongsTo TraceLocation
+- toEnterprise(): BelongsTo Enterprise
+- fromEnterprise(): BelongsTo Enterprise
+- eventCertificates(): HasMany EventCertificate
+- publisher(): BelongsTo User (published_by)
+
+Constants:
+- CATEGORY_LABELS: array map event_category → tiếng Việt
+- CTE_ICONS: array map cte_code → emoji (giống code cũ)
+
+Helpers:
+- isObservation(): bool
+- isTransformation(): bool
+- isTransferIn(): bool
+- isTransferOut(): bool
+- isPublished(): bool
+- isPending(): bool — transfer đang chờ xác nhận
+- canAddInputs(): bool — chỉ khi status=draft
+- generateEventCode(string $enterpriseCode, string $cteCode, int $seq): string static
+  Format: EVT-{ENT_CODE}-{CTE_UPPER_7}-{YYYYMM}-{SEQ3}
+  VD: EVT-XYZ-HARVEST-202603-001
+- toIpfsPayload(): array — giữ logic cũ, thêm event_code, input/output batches, location GS1
+
+--- Model 2: Batch (refactor) ---
+File: app/Models/Batch.php
+
+Relations thêm:
+- originEvent(): BelongsTo TraceEvent (origin_event_id)
+- inputEvents(): BelongsToMany TraceEvent qua event_input_batches
+- outputEvents(): BelongsToMany TraceEvent qua event_output_batches
+- eventCertificates(): HasMany EventCertificate
+
+Helpers thêm:
+- isConsumed(): bool
+- isTransferred(): bool
+- isActive(): bool
+- getGs1128Label(): string — dùng GS1Service, cache vào gs1_128_label
+- getGtinCached(): string — dùng QrCodeService::resolveGtin(), cache
+
+Giữ nguyên toàn bộ logic cũ (TenantScope, recall, certificates, lineage).
+
+--- Model 3: EventCertificate (mới) ---
+File: app/Models/EventCertificate.php
+
+Relations:
+- traceEvent(): BelongsTo TraceEvent
+- batch(): BelongsTo Batch
+- certificate(): BelongsTo Certificate (nullable)
+
+Helpers:
+- isExpired(): bool
+- getDisplayName(): string
+
+LƯU Ý:
+- Giữ $fillable đầy đủ
+- $casts cho datetime, json fields
+- Không xóa relation/helper cũ của TraceEvent và Batch
+
+🟠 PHASE 2 — Event Engine
+Prompt 2.1 — ObservationEventController
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+- Đọc TraceEvent model, Batch model, TraceLocation model trước
+- Observation event: ghi nhận trạng thái, KHÔNG sinh lô mới, KHÔNG thay đổi status lô
+- Ví dụ: Gieo hạt, Bón phân, Lưu kho, Kiểm định
+
+NHIỆM VỤ:
+Viết app/Http/Controllers/ObservationEventController.php
+
+Methods:
+1. store(Request $request): RedirectResponse
+   Validate:
+   - cte_code: required|string
+   - event_time: required|date
+   - who_name: required|string|max:255
+   - trace_location_id: nullable|exists:trace_locations,id — validate tenant
+   - kde_data: nullable|array
+   - note: nullable|string
+   - input_batch_ids: required|array|min:1
+   - input_batch_ids.*: exists:batches,id — validate tenant ownership
+   - why_reason: nullable|string
+   - has_certification: nullable|boolean
+   - certification.certificate_id: required_if:has_certification,true
+   - certification.result: required_if:has_certification,true|in:pass,fail,conditional
+   - certification.reference_no: nullable|string
+   - certification.issued_date: nullable|date
+   - certification.expiry_date: nullable|date|after:certification.issued_date
+
+   Logic:
+   - Tạo TraceEvent với event_category='observation'
+   - Generate event_code tự động (query MAX seq của tháng hiện tại)
+   - Gắn input_batch_ids vào event_input_batches pivot
+   - Nếu has_certification=true → tạo EventCertificate cho từng input batch
+   - Không thay đổi status của bất kỳ batch nào
+   - Wrap trong DB::transaction()
+   - Return redirect với success message
+
+2. update(Request $request, TraceEvent $event): RedirectResponse
+   - Chỉ cho update khi status='draft'
+   - assertTenant check
+   - Validate tương tự store
+   - Sync lại input_batch_ids
+   - Update EventCertificate nếu có
+
+3. destroy(Request $request, TraceEvent $event): RedirectResponse
+   - Chỉ xóa khi status='draft'
+   - assertTenant check
+   - Detach input batches trước
+   - Xóa EventCertificate liên quan
+
+LƯU Ý:
+- Dùng trait HasTenantId (tenantId($request))
+- Validate batch ownership: batch.enterprise_id === tenantId
+- Validate trace_location ownership tương tự
+- Không publish trong controller này — publish riêng
+
+Prompt 2.2 — TransformationEventController
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+- Đọc kỹ TraceEvent, Batch, BatchLineage models trước
+- Transformation event: biến đổi trạng thái, TIÊU THỤ lô input, SINH lô output mới
+- Ví dụ: Thu hoạch, Xay xát, Đóng gói, Tách lô, Gộp lô
+- Đây là MỐCLUẬT quan trọng nhất theo TT02
+
+NHIỆM VỤ:
+Viết app/Http/Controllers/TransformationEventController.php
+
+Methods:
+1. store(Request $request): RedirectResponse
+   Validate:
+   - cte_code: required|string
+   - event_time: required|date
+   - who_name: required|string|max:255
+   - trace_location_id: nullable|exists:trace_locations,id
+   - kde_data: nullable|array
+   - note: nullable|string
+   - input_batches: required|array|min:1
+   - input_batches.*.id: exists:batches,id
+   - input_batches.*.quantity: nullable|numeric|min:0.001
+   - input_batches.*.unit: nullable|string
+   - output_product_id: required|exists:products,id — sản phẩm của lô output
+   - output_quantity: required|numeric|min:0.001
+   - output_unit: required|string|max:50
+   - output_batch_type: required|in:raw_material,wip,finished
+   - output_production_date: nullable|date
+   - output_expiry_date: nullable|date
+
+   Logic trong DB::transaction():
+   a. Validate tất cả input batches thuộc tenant + status='active'
+   b. Tạo TraceEvent với event_category='transformation'
+   c. Generate event_code
+   d. Gắn input batches vào event_input_batches
+   e. Update input batches: status='consumed', current_quantity=0
+   f. Auto-sinh Batch output mới:
+      - enterprise_id = tenantId
+      - origin_event_id = event vừa tạo
+      - code = generateBatchCode() với prefix theo category
+      - batch_type = output_batch_type
+      - product_id = output_product_id
+      - gtin_cached = QrCodeService::resolveGtin()
+      - gs1_128_label = GS1Service::buildGS1_128()
+      - status = 'active'
+   g. Gắn output batch vào event_output_batches
+   h. Tạo BatchLineage records (giữ compatibility với code cũ):
+      - transformation_type = xác định từ cte_code
+      - input_batch_id, output_batch_id
+   i. Gọi QrCodeService::ensureForBatch() cho output batch
+
+   Return: redirect đến trang batch output vừa tạo
+   Flash message: "Đã tạo sự kiện + lô [code]. Vui lòng điền đủ dữ liệu và publish."
+
+2. show(Request $request, TraceEvent $event): Response
+   Trả về Inertia page TransformationEvents/Show với đầy đủ:
+   - event data
+   - inputBatches với events của từng batch
+   - outputBatches
+   - location data
+
+LƯU Ý QUAN TRỌNG:
+- Batch input consumed KHÔNG thể undo sau khi event published
+- Khi event còn draft → cho phép hủy (rollback consumed status)
+- destroy() phải: restore input batches status='active', xóa output batch, xóa lineage
+
+Prompt 2.3 — TransferEventController
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+- Đọc TraceEvent, Batch, Enterprise, BatchTransfer models
+- Transfer event gồm 2 chiều:
+  transfer_out: DN A gửi → lô chuyển sang DN B (pending xác nhận)
+  transfer_in:  nhập từ bên ngoài hệ thống → sinh lô mới (không cần xác nhận)
+- Đây là MỐCLUẬT bắt buộc theo TT02
+
+NHIỆM VỤ:
+Viết app/Http/Controllers/TransferEventController.php
+
+--- Method 1: storeTransferOut ---
+POST /events/transfer-out
+
+Validate:
+- input_batch_ids: required|array|min:1
+- input_batch_ids.*: exists:batches,id
+- to_enterprise_id: required|exists:enterprises,id — khác tenantId
+- event_time: required|date
+- who_name: required|string
+- kde_data: nullable|array
+- gs1_document_ref: nullable|string — AI(400) số hợp đồng
+- sscc_code: nullable|string — AI(00)
+
+Logic:
+- Tạo TraceEvent event_category='transfer_out', transfer_status='pending'
+- Gắn input batches (KHÔNG consumed yet — chờ đối tác confirm)
+- Tạo BatchTransfer record (giữ compatibility)
+- Gửi notification cho to_enterprise users
+- Return redirect với "Đã gửi lệnh chuyển giao, chờ xác nhận."
+
+--- Method 2: acceptTransfer ---
+POST /events/transfer/{event}/accept
+
+Logic trong DB::transaction():
+- Validate event thuộc to_enterprise_id của current tenant
+- Validate transfer_status='pending'
+- Update event: transfer_status='accepted', accepted_at=now()
+- Update input batches: enterprise_id = tenantId (đổi chủ)
+- Tạo TraceEvent mới event_category='transfer_in' cho bên nhận
+  với from_enterprise_id = enterprise cũ
+- Publish cả 2 events lên IPFS + Fabric (gọi service)
+- Gửi notification cho bên gửi
+
+--- Method 3: rejectTransfer ---
+POST /events/transfer/{event}/reject
+
+Validate: rejection_reason required
+
+Logic:
+- Update event: transfer_status='rejected'
+- Input batches GIỮ NGUYÊN status (không thay đổi gì)
+- Notify bên gửi
+
+--- Method 4: storeTransferIn (nhập từ ngoài hệ thống) ---
+POST /events/transfer-in
+
+Validate:
+- external_party_name: required|string — tên nhà cung cấp bên ngoài
+- external_ref: nullable|string — số hóa đơn
+- output_product_id: required|exists:products,id
+- output_quantity: required|numeric|min:0.001
+- output_unit: required|string
+- output_batch_type: required|in:raw_material,wip,finished
+- event_time, who_name, kde_data, trace_location_id...
+
+Logic:
+- Tạo TraceEvent event_category='transfer_in'
+  from_enterprise_id = NULL (bên ngoài)
+  external_party_name, external_ref ghi lại
+  transfer_status = 'accepted' (tự động — không cần xác nhận)
+- Auto-sinh Batch output (giống TransformationEventController)
+- Publish ngay lên IPFS + Fabric
+
+LƯU Ý:
+- Inbox page: danh sách transfer_out events pending mà to_enterprise = tenantId
+- Cần notify realtime hoặc email khi có transfer mới
+
+🟡 PHASE 3 — Lineage & QR Scan
+Prompt 3.1 — Lineage Traversal
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+Schema mới: Batch có origin_event_id → TraceEvent → event_input_batches → nhiều Batch cha
+Thay thế collectAncestorBatchIds() cũ dùng parent_batch_id.
+
+NHIỆM VỤ:
+Viết app/Services/LineageService.php
+
+Methods:
+
+1. collectAllBatchIds(int $batchId, int $maxDepth = 15): array
+   Đệ quy BFS/DFS theo hướng:
+     batch → origin_event_id → event_input_batches → batch cha → lại từ đầu
+   Return: array tất cả batch IDs trong cây lineage (bao gồm chính nó)
+   Tránh infinite loop bằng visited set
+   Giới hạn maxDepth để tránh cycle
+
+2. buildLineageGraph(int $batchId): array
+   Return graph dạng:
+   {
+     nodes: [{ id, code, product_name, enterprise, batch_type, status, event_count }]
+     edges: [{ from, to, type, label }]
+   }
+   Dùng cho visualization (giữ compatible với Batches/Lineage.vue hiện tại)
+
+3. loadPublishedEvents(int $batchId): Collection
+   - Gọi collectAllBatchIds()
+   - Load tất cả TraceEvents published của các batches đó
+   - withoutGlobalScopes() — vì cross-tenant
+   - Eager load: inputBatches.enterprise, outputBatches, traceLocation, eventCertificates
+   - Order by event_time ASC
+   - Return Collection
+
+4. formatEventForPublic(TraceEvent $event): array
+   Format event để hiển thị trên trang public scan (Trace/Show.vue)
+   Gồm: id, event_code, cte_code, event_category, event_time formatted,
+        who_name, location (GLN + address), kde_data, attachments,
+        ipfs_cid, content_hash, certificates[], enterprise name
+
+LƯU Ý:
+- withoutGlobalScopes() bắt buộc vì lineage cross-tenant
+- Chỉ expose published events ra public
+- Cache result 5 phút nếu tất cả events đã published
+
+Prompt 3.2 — QrScanController refactor
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+- Đọc LineageService vừa tạo
+- QR scan là public endpoint — không cần auth
+- Lookup batch qua GTIN + lot code (GS1 Digital Link)
+- Cross-tenant: batch có thể thuộc enterprise khác
+
+NHIỆM VỤ:
+Refactor app/Http/Controllers/QrScanController.php
+
+Thay thế collectAncestorBatchIds() inline 
+→ inject và dùng LineageService
+
+Trong loadEvents():
+  Thay bằng LineageService::loadPublishedEvents()
+  Thay bằng LineageService::formatEventForPublic()
+
+Trong formatBatch():
+  Thêm field: origin_event_code (event_code của origin_event)
+  Thêm field: gs1_128_label từ batch
+  Thêm field: ai01_code từ GS1Service
+
+Giữ nguyên:
+- resolvePublic(), resolvePrivate(), resolveGs1Public()
+- Geo-fencing logic
+- Scan logging
+- Recall detection
+
+🟢 PHASE 4 — GS1 / TT02 Compliance
+Prompt 4.1 — GS1 Enforcement
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+Thông tư 02/2024/TT-BKHCN + TCVN 13274:2020
+Các AI bắt buộc trong hệ thống:
+  AI(01)  — GTIN-14 sản phẩm
+  AI(10)  — Mã lô
+  AI(11)  — Ngày sản xuất YYMMDD
+  AI(17)  — Hạn sử dụng YYMMDD
+  AI(251) — Mã tham chiếu nguồn gốc (event_code)
+  AI(400) — Số chứng từ (hợp đồng, phiếu kiểm)
+  AI(414) — GLN địa điểm vật lý
+  AI(416) — GLN địa điểm sản xuất/vùng trồng
+  AI(417) — GLN doanh nghiệp
+  AI(00)  — SSCC vận chuyển
+
+NHIỆM VỤ:
+Mở rộng app/Services/GS1Service.php — KHÔNG xóa method cũ
+
+Thêm methods:
+
+1. buildFullLabel(Batch $batch, ?TraceEvent $event = null): array
+   Return tất cả AI codes cho 1 lô:
+   {
+     ai01: "(01)08938503XXXXXX",
+     ai10: "(10)LOT-LUA-XYZ-202603-001",
+     ai11: "(11)260315",  // production date
+     ai17: "(17)270315",  // expiry date (nếu có)
+     ai251: "(251)EVT-XYZ-HARVEST-202603-001",  // nếu có event
+     ai416: "(416)8930000001234",  // nếu có location
+     ai417: "(417)8930000001001",  // GLN enterprise
+     gs1_128: "(01)...(10)...(11)...(17)...",  // full string
+     digital_link: "https://domain/01/08938503.../10/LOT-..."
+   }
+
+2. buildSscc(int $enterpriseId, int $seq): string
+   Format SSCC 18 số: (00)0{extension}{companyPrefix}{serial}{check}
+   Extension digit = 0-9 (dùng 0 mặc định)
+   Serial = seq padded
+
+3. validateEventCode(string $code): bool
+   Validate format: EVT-{2-10 chars}-{2-10 chars}-{6 digits}-{3 digits}
+
+4. parseGs1String(string $gs1): array
+   Parse chuỗi GS1-128 → array [ai => value]
+   VD: "(01)08938503...(10)LOT-..." → ['01' => '08938503...', '10' => 'LOT-...']
+
+Thêm validation rule:
+app/Rules/ValidGln.php — validate GLN 13 số + check digit
+app/Rules/ValidGtin.php — validate GTIN 8/12/13/14 + check digit
+app/Rules/ValidEventCode.php — validate event code format
+
+🔵 PHASE 5 — Frontend
+Prompt 5.1 — Form tạo sự kiện
+Bạn là Vue 3 + Inertia.js developer chuyên sâu.
+Stack: Vue 3 Composition API, Tailwind CSS, dark theme hiện tại.
+
+CONTEXT:
+- Đọc các component UI hiện có trong resources/js/Components/ui/
+- Đọc Events/Index.vue để hiểu pattern hiện tại
+- 3 loại form: Observation, Transformation, TransferOut, TransferIn
+
+NHIỆM VỤ:
+Tạo các components sau:
+
+1. resources/js/Pages/Events/CreateObservation.vue
+   Props: batches[], locations[], cte_options[], certificates[]
+   Form fields:
+   - cte_code: select (Gieo hạt, Bón phân, Kiểm định, Lưu kho...)
+   - event_time: datetime-local
+   - who_name: text
+   - trace_location_id: searchable select → hiển thị AI code + tên
+   - input_batch_ids: multi-select với search → hiển thị code + product name + quantity
+   - kde_data: dynamic key-value fields theo cte_code
+   - has_certification: toggle
+   - certification fields: hiện/ẩn theo toggle
+   - note: textarea
+
+2. resources/js/Pages/Events/CreateTransformation.vue
+   Props: batches[], locations[], products[], cte_options[]
+   Form fields:
+   - Tất cả của Observation +
+   - Section "Lô output tự động sinh":
+     output_product_id: select
+     output_quantity + output_unit
+     output_batch_type: select
+     output_production_date, output_expiry_date
+   - Preview: "Sự kiện này sẽ tiêu thụ X lô input và tạo ra lô [code preview]"
+
+3. resources/js/Pages/Events/CreateTransferOut.vue
+   Props: batches[], enterprises[]
+   Form fields:
+   - input_batch_ids: multi-select
+   - to_enterprise_id: select (các enterprise khác trong hệ thống)
+   - gs1_document_ref: text — AI(400)
+   - sscc_code: text (auto-generate hoặc nhập tay)
+   - event_time, who_name, kde_data, note
+
+4. resources/js/Components/events/KdeFields.vue
+   Component dynamic fields theo cte_code:
+   - planting: giống, mật độ, phương pháp
+   - growing: loại phân, liều lượng, thuốc BVTV
+   - harvesting: năng suất, độ ẩm, tạp chất, phương tiện
+   - processing: tỉ lệ thành phẩm, công suất
+   - packaging: quy cách, số lượng
+   - inspection: số phiếu, chỉ tiêu[], kết quả
+   - shipping: phương tiện, tài xế, tuyến đường
+   Mỗi CTE có template fields riêng, fallback generic key-value
+
+DESIGN:
+- Giữ dark theme hiện tại
+- Multi-select batch dùng component có search + badge selected
+- Khi chọn input batch → hiển thị mini card: tên SP, mã lô, số lượng, enterprise
+- Warning rõ ràng khi transformation: "Các lô input sẽ bị tiêu thụ sau khi publish"
+
+Prompt 5.2 — Timeline & Public Trace
+Bạn là Vue 3 developer chuyên sâu.
+
+CONTEXT:
+- Đọc resources/js/Pages/Trace/Show.vue hiện tại
+- LineageService::formatEventForPublic() trả về event data mới
+- Người tiêu dùng quét QR → thấy toàn bộ chuỗi
+
+NHIỆM VỤ:
+Refactor resources/js/Pages/Trace/Show.vue
+
+Timeline mới phải hiển thị:
+1. Header lô hàng:
+   - Tên sản phẩm + GTIN AI(01)
+   - Mã lô AI(10)
+   - GS1-128 label đầy đủ
+   - Enterprise hiện tại sở hữu
+
+2. Timeline events theo thứ tự event_time:
+   Mỗi event node gồm:
+   - Icon theo cte_code
+   - event_code (251)EVT-...
+   - Thời gian + WHO + WHERE (tên địa điểm + AI code)
+   - KDE data theo từng loại (không dump JSON thô)
+   - Enterprise thực hiện (có thể khác enterprise sở hữu lô)
+   - Badge: OBSERVATION / TRANSFORMATION / TRANSFER
+   - IPFS CID nếu published + nút verify
+   - Certificates nếu là inspection event
+
+3. Lineage panel (collapsible):
+   Hiển thị cây nguồn gốc:
+   NL-GIONG → [Thu hoạch] → LOT-LUA → [Xay xát] → LOT-GAO → [Đóng gói] → LOT-TP
+   Mỗi node có thể click → xem batch đó
+
+4. Section chứng nhận:
+   Tổng hợp tất cả certificates từ toàn bộ chuỗi
+   VietGAP từ HTX, HACCP từ Lộc Trời...
+
+DESIGN:
+- Timeline dọc với connector line
+- Events của HTX màu khác events của Lộc Trời
+- IPFS verified = green badge
+- Transfer events nổi bật hơn (border màu khác)
+- Mobile responsive
+
+🟣 PHASE 6 — Blockchain & IPFS
+Prompt 6.1 — Publish Engine
+Bạn là Laravel developer chuyên sâu.
+
+CONTEXT:
+- Đọc TraceEventController@publish hiện tại
+- Đọc IpfsService, BlockchainService hiện tại
+- Schema mới: event không có batch_id, có input/output batches
+
+NHIỆM VỤ:
+Refactor publish logic trong TraceEventController@publish
+
+Thay đổi toIpfsPayload():
+- Load inputBatches với enterprise, location
+- Load outputBatches với enterprise
+- Load traceLocation với GS1 AI code
+- Load eventCertificates
+- Thêm: event_code AI(251)
+- Thêm: gs1_document_ref AI(400)
+- Thêm: full GS1 identifiers cho từng input/output batch
+- Giữ: content_hash SHA-256 của payload
+
+Sau khi publish thành công:
+- Nếu event_category='transformation': 
+  update output batch gs1_128_label, gtin_cached
+  gọi QrCodeService::ensureForBatch() cho output batch
+- Nếu event_category='transfer_out' + accepted:
+  update enterprise_id của input batches
+- Gửi email thông báo cho các bên liên quan
+
+Retry mechanism:
+- Nếu Fabric lỗi → queue job RetryFabricPublishJob
+- Job retry sau 5 phút, tối đa 3 lần
+- Sau 3 lần fail → notify admin
+
+LƯU Ý:
+- IPFS upload vẫn blocking (phải có CID trước)
+- Fabric là non-blocking (đã có pattern cũ)
+- content_hash tính trên full payload bao gồm input/output batches
+
+📋 Thứ tự thực hiện
+Phase 1.1 → 1.2   (schema + models — nền tảng)
+     ↓
+Phase 2.1 → 2.2 → 2.3   (event engine — logic chính)
+     ↓
+Phase 3.1 → 3.2   (lineage + QR scan)
+     ↓
+Phase 4.1   (GS1 compliance)
+     ↓
+Phase 5.1 → 5.2   (frontend)
+     ↓
+Phase 6.1   (blockchain)
+Lưu ý cho agent:
+
+Đọc code hiện có trước khi viết — không overwrite logic đang dùng
+Mỗi phase test được độc lập trước khi sang phase tiếp
+Giữ backward compatibility với QrScanController và BatchController cũ trong Phase 1-2
+Chỉ xóa code cũ ở Phase 3 khi LineageService đã test xong
